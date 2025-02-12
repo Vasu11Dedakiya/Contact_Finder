@@ -8,7 +8,7 @@ import phonenumbers
 app = Flask(__name__)
 
 # Set your Google Gemini API Key
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+GEMINI_API_KEY = "AIzaSyB5LdU_W42nICA2gSJYKzsO9X4myn60zR4"
 genai.configure(api_key=GEMINI_API_KEY)
 
 
