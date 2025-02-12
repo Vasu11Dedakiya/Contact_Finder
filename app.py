@@ -1,9 +1,15 @@
 import re
+import json
 import requests
 import google.generativeai as genai
+import phonenumbers
 from bs4 import BeautifulSoup
 from flask import Flask, request, render_template
-import phonenumbers
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from pdfminer.high_level import extract_text
+import threading
 
 app = Flask(__name__)
 
@@ -13,76 +19,98 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 
 def scrape_website(url):
-    """
-    Scrapes and returns a BeautifulSoup object from the given website URL.
-    """
+    """Scrapes text content from a given website URL."""
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers)
-    response.raise_for_status()  # Raise an exception for HTTP errors
     soup = BeautifulSoup(response.text, 'html.parser')
-    return soup
+    return soup.get_text(separator=' ', strip=True)
 
 
-def extract_phone_numbers(soup):
-    """
-    Extracts and validates phone numbers using both 'tel:' links and regex-based scanning.
-    It uses the phonenumbers library for parsing and validating numbers.
-    """
-    phone_numbers_set = set()
+def scrape_with_selenium(url):
+    """Uses a headless browser to scrape JavaScript-rendered pages."""
+    options = Options()
+    options.add_argument("--headless")
+    service = Service("chromedriver")  # Ensure you have ChromeDriver installed
+    driver = webdriver.Chrome(service=service, options=options)
 
-    # First, extract phone numbers from "tel:" links
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        if href.startswith('tel:'):
-            number = href[4:].strip()
-            try:
-                parsed_number = phonenumbers.parse(number, None)
-            except Exception:
-                try:
-                    parsed_number = phonenumbers.parse(number, "US")
-                except Exception:
-                    continue
-            if phonenumbers.is_valid_number(parsed_number):
-                formatted = phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
-                phone_numbers_set.add(formatted)
+    driver.get(url)
+    page_source = driver.page_source
+    driver.quit()
 
-    # Then, scan the visible text using a more general regex pattern.
-    text = soup.get_text(separator=' ', strip=True)
-    # This pattern looks for sequences of digits and allowed punctuation
-    phone_pattern = re.compile(r'\+?\d[\d\s\-\(\)]{8,}\d')
-    potential_numbers = phone_pattern.findall(text)
+    soup = BeautifulSoup(page_source, 'html.parser')
+    return soup.get_text(separator=' ', strip=True)
 
-    for num in potential_numbers:
-        num = num.strip()
-        # Filter out year ranges like "2015-2024"
-        if re.match(r'^\d{4}[-–]\d{4}$', num):
-            continue
-        try:
-            parsed_number = phonenumbers.parse(num, None)
-        except Exception:
-            try:
-                parsed_number = phonenumbers.parse(num, "US")
-            except Exception:
-                continue
-        if phonenumbers.is_valid_number(parsed_number):
-            formatted = phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
-            phone_numbers_set.add(formatted)
 
-    return list(phone_numbers_set)
+def extract_phone_numbers(text, region="IN"):
+    """Extracts and validates phone numbers using the phonenumbers library."""
+    phone_numbers = set()
+
+    for match in phonenumbers.PhoneNumberMatcher(text, region):
+        if phonenumbers.is_valid_number(match.number):  # Check if it's a valid number
+            formatted = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+            phone_numbers.add(formatted)
+
+    return list(phone_numbers)
+
+
+def extract_hidden_api_data(url):
+    """Attempts to find phone numbers from hidden APIs."""
+    api_endpoints = ["/api/contacts", "/data/phonebook", "/public/phone_list"]
+    phone_numbers = []
+
+    for endpoint in api_endpoints:
+        response = requests.get(url + endpoint)
+        if response.status_code == 200:
+            text = json.dumps(response.json())
+            phone_numbers.extend(extract_phone_numbers(text))
+
+    return list(set(phone_numbers))
+
+
+def enumerate_hidden_directories(base_url):
+    """Finds phone numbers in hidden directories."""
+    directories = ["contacts", "employees", "phonebook", "data", "public"]
+    file_types = ["pdf", "txt", "csv", "xlsx"]
+    phone_numbers = []
+
+    for directory in directories:
+        for file_type in file_types:
+            url = f"{base_url}/{directory}/contacts.{file_type}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                text = extract_text(response.content) if file_type == "pdf" else response.text
+                phone_numbers.extend(extract_phone_numbers(text))
+
+    return list(set(phone_numbers))
 
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
         url = request.form['url']
-        try:
-            soup = scrape_website(url)
-            phone_numbers = extract_phone_numbers(soup)
+        domain = url.split("//")[-1].split("/")[0]
 
-            result_text = "\n".join(phone_numbers) if phone_numbers else "No phone numbers found."
-            return render_template('index.html', result=result_text, url=url)
-        except Exception as e:
-            return render_template('index.html', error=str(e))
+        results = {"basic_scrape": [], "selenium_scrape": [], "api_search": [], "directory_enum": []}
+
+        threads = [
+            threading.Thread(target=lambda: results.update({"basic_scrape": extract_phone_numbers(scrape_website(url))})),
+            threading.Thread(target=lambda: results.update({"selenium_scrape": extract_phone_numbers(scrape_with_selenium(url))})),
+            threading.Thread(target=lambda: results.update({"api_search": extract_hidden_api_data(url)})),
+            threading.Thread(target=lambda: results.update({"directory_enum": enumerate_hidden_directories(url)}))
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        all_phone_numbers = list(set(results["basic_scrape"] + results["selenium_scrape"] +
+                                     results["api_search"] + results["directory_enum"]))
+
+        result_text = "📞 Extracted Phone Numbers:\n" + "\n".join(all_phone_numbers) if all_phone_numbers else "No phone numbers found."
+
+        return render_template('index.html', result=result_text, url=url)
+
     return render_template('index.html')
 
 
